@@ -30,6 +30,11 @@
 #define DEVICE_NAME        "container_monitor"
 #define CHECK_INTERVAL_SEC 1
 
+/* Kernel 6.15+ renamed del_timer_sync to timer_delete_sync */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+#define timer_delete_sync del_timer_sync
+#endif
+
 /* --- Monitored entry node (one per registered container PID) --- */
 struct monitored_entry {
     pid_t            pid;
@@ -270,7 +275,7 @@ static void __exit monitor_exit(void)
 {
     struct monitored_entry *entry, *tmp;
 
-    del_timer_sync(&monitor_timer);
+    timer_delete_sync(&monitor_timer);
 
 
     mutex_lock(&monitored_lock);
