@@ -802,7 +802,13 @@ static void reap_children(supervisor_ctx_t *ctx)
     int wstatus;
     pid_t pid;
 
-    while ((pid = waitpid(-1, &wstatus, WNOHANG)) > 0) {
+    while ((pid = waitpid(-1, &wstatus, WNOHANG)) != 0) {
+        if (pid < 0) {
+            if (errno == ECHILD) break;  /* no children — perfectly normal */
+            if (errno == EINTR)  continue;
+            perror("waitpid");
+            break;
+        }
         container_record_t *r;
 
         pthread_mutex_lock(&ctx->metadata_lock);
@@ -915,14 +921,15 @@ static int run_supervisor(const char *rootfs)
 
         int sel = select(nfds, &rfds, NULL, NULL, &tv);
 
-        /* Reap any children that exited */
-        if (g_signal_received) {
-            g_signal_received = 0;
-            reap_children(&ctx);
-        }
+        /* Reap any children that exited (from SIGCHLD or select wakeup) */
+        reap_children(&ctx);
+        g_signal_received = 0;
 
         if (sel < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                reap_children(&ctx);
+                continue;
+            }
             perror("select");
             break;
         }
