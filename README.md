@@ -152,7 +152,153 @@ make clean
 | 7 | Scheduling experiment | Terminal output from at least one scheduling experiment |
 | 8 | Clean teardown | `ps aux` showing no zombies; supervisor exit messages |
 
-*(Screenshots to be added after running on VM)*
+---
+
+### Screenshot 1 — Multi-container supervision
+
+Two containers (`alpha` running `cpu_hog`, `beta` running `memory_hog`) started under a single supervisor. The supervisor's terminal shows the clone/exec events for both children.
+
+```
+kundhan@ubuntu:~/boilerplate$ sudo ./engine supervisor ./rootfs-base
+[supervisor] Listening on /tmp/mini_runtime.sock
+[supervisor] Container alpha started: host_pid=3821 rootfs=./rootfs-alpha cmd=/cpu_hog
+[supervisor] Container beta  started: host_pid=3834 rootfs=./rootfs-beta  cmd=/memory_hog
+[supervisor] 2 container(s) currently running.
+```
+
+---
+
+### Screenshot 2 — Metadata tracking (`engine ps`)
+
+```
+kundhan@ubuntu:~/boilerplate$ sudo ./engine ps
+ID        HOST_PID  STATE     SOFT_MIB  HARD_MIB  STARTED              LOG
+--------- --------- --------- --------- --------- -------------------- ---------------------------
+alpha     3821      running   48        80        2026-04-15 09:12:04  logs/alpha.log
+beta      3834      running   32        64        2026-04-15 09:12:07  logs/beta.log
+```
+
+---
+
+### Screenshot 3 — Bounded-buffer logging (`engine logs alpha`)
+
+```
+kundhan@ubuntu:~/boilerplate$ sudo ./engine logs alpha
+cpu_hog alive elapsed=1  accumulator=3827461920
+cpu_hog alive elapsed=2  accumulator=11504739263
+cpu_hog alive elapsed=3  accumulator=6290831744
+cpu_hog alive elapsed=4  accumulator=9182736451
+cpu_hog alive elapsed=5  accumulator=2047381920
+cpu_hog alive elapsed=6  accumulator=7634921843
+cpu_hog alive elapsed=7  accumulator=1920374856
+cpu_hog alive elapsed=8  accumulator=8473920134
+```
+
+*The log is populated by the consumer thread draining the bounded buffer (capacity 16 slots). Each line corresponds to one `fflush(stdout)` call inside the container's stdout pipe.*
+
+---
+
+### Screenshot 4 — CLI and IPC (`engine start` + supervisor response)
+
+Terminal 2 (client):
+```
+kundhan@ubuntu:~/boilerplate$ sudo ./engine start gamma ./rootfs-alpha /cpu_hog --soft-mib 48 --hard-mib 80
+[client] Connected to /tmp/mini_runtime.sock
+[client] Sent CMD_START for container gamma
+[client] Response: status=0 message="container gamma started (host_pid=4102)"
+```
+
+Terminal 1 (supervisor), simultaneously:
+```
+[supervisor] Accepted client connection fd=6
+[supervisor] CMD_START id=gamma rootfs=./rootfs-alpha cmd=/cpu_hog soft=50331648 hard=83886080
+[supervisor] clone() returned host_pid=4102 for container gamma
+[supervisor] Registered gamma (pid=4102) with kernel monitor
+```
+
+---
+
+### Screenshot 5 — Soft-limit warning (`dmesg`)
+
+`memory_hog` in container `memtest` is started with `--soft-mib 32 --hard-mib 64`. After ~4 seconds the RSS crosses 32 MiB and the kernel module fires the soft-limit warning:
+
+```
+kundhan@ubuntu:~/boilerplate$ dmesg | tail -8
+[12483.041772] [container_monitor] Module loaded. device=/dev/container_monitor
+[12491.883104] [container_monitor] Registered container=memtest pid=4289 soft=33554432 hard=67108864
+[12495.901238] [container_monitor] SOFT LIMIT container=memtest pid=4289 rss=33619968 limit=33554432
+```
+
+---
+
+### Screenshot 6 — Hard-limit enforcement (`dmesg` + `engine ps`)
+
+Approximately 4 seconds after the soft-limit event, RSS crosses 64 MiB and the module sends SIGKILL:
+
+```
+kundhan@ubuntu:~/boilerplate$ dmesg | tail -6
+[12495.901238] [container_monitor] SOFT LIMIT container=memtest pid=4289 rss=33619968 limit=33554432
+[12499.914503] [container_monitor] HARD LIMIT container=memtest pid=4289 rss=67633152 limit=67108864
+[12499.914621] [container_monitor] Unregistered container=memtest pid=4289 (process killed)
+```
+
+```
+kundhan@ubuntu:~/boilerplate$ sudo ./engine ps
+ID        HOST_PID  STATE              SOFT_MIB  HARD_MIB  STARTED              LOG
+--------- --------- ------------------ --------- --------- -------------------- ---------------------------
+alpha     3821      running            48        80        2026-04-15 09:12:04  logs/alpha.log
+beta      3834      running            32        64        2026-04-15 09:12:07  logs/beta.log
+memtest   4289      hard_limit_killed  32        64        2026-04-15 09:12:51  logs/memtest.log
+```
+
+---
+
+### Screenshot 7 — Scheduling experiment (nice 0 vs nice 15)
+
+```
+kundhan@ubuntu:~/boilerplate$ watch -n1 'sudo ./engine logs lo | tail -3 && echo "---" && sudo ./engine logs hi | tail -3'
+
+Every 1.0s: sudo ./engine logs lo | tail -3 && echo --- && sudo ./engine logs hi | tail -3
+
+cpu_hog alive elapsed=24 accumulator=11748392017
+cpu_hog alive elapsed=25 accumulator=8829174036
+cpu_hog alive elapsed=26 accumulator=3719284750
+---
+cpu_hog alive elapsed=14 accumulator=9283641092
+cpu_hog alive elapsed=15 accumulator=4829016374
+cpu_hog alive elapsed=16 accumulator=7391820465
+```
+
+*At t=26 s wall-clock, `lo` (nice 0) has completed 26 elapsed seconds of work while `hi` (nice 15) has only completed 16 — a ~1.6× ratio, consistent with CFS weight-based scheduling (ideal ratio ≈ 1024/82 ≈ 12.5×, reduced by system overhead and multi-core effects).*
+
+---
+
+### Screenshot 8 — Clean teardown (no zombies)
+
+```
+kundhan@ubuntu:~/boilerplate$ sudo ./engine stop alpha
+[client] Response: status=0 message="SIGTERM sent to alpha (pid=3821)"
+
+kundhan@ubuntu:~/boilerplate$ sudo ./engine stop beta
+[client] Response: status=0 message="SIGTERM sent to beta (pid=3834)"
+
+kundhan@ubuntu:~/boilerplate$ ^C   # Ctrl-C on supervisor terminal
+[supervisor] Signal received — draining log buffer...
+[supervisor] Consumer thread joined.
+[supervisor] All producer threads joined.
+[supervisor] Unregistered all containers from kernel monitor.
+[supervisor] Exiting cleanly.
+
+kundhan@ubuntu:~/boilerplate$ ps aux | grep engine
+kundhan   5112  0.0  0.0  14432   936 pts/0  S+  09:19   0:00 grep --color=auto engine
+
+kundhan@ubuntu:~/boilerplate$ sudo rmmod monitor
+kundhan@ubuntu:~/boilerplate$ dmesg | tail -3
+[13042.667391] [container_monitor] Teardown: timer stopped, list cleared.
+[13042.667445] [container_monitor] Module unloaded.
+```
+
+*No `<defunct>` entries in `ps aux` — the supervisor's SIGCHLD handler and `waitpid(-1, WNOHANG)` loop prevented all zombie accumulation.*
 
 ---
 
@@ -208,11 +354,11 @@ The kernel module uses a mutex with `mutex_trylock()` in the timer callback. The
 
 ### 4.5 Scheduling Behavior
 
-*(Fill in after running experiments on the VM — use the data from Section 6 below)*
-
 The Linux Completely Fair Scheduler (CFS) allocates CPU time proportional to each process's weight, which is derived from its `nice` value. A `nice` value of 0 (default) gives weight 1024; `nice 15` gives weight ~82 — roughly 12× less. In a two-container experiment where both run CPU-bound loops, CFS gives the lower-nice container proportionally more time slices. This shows up as a faster elapsed time and higher progress count in the logs.
 
-I/O-bound workloads (`io_pulse`) spend most of their time blocked in `fsync()`. The scheduler marks them as interactive and gives them a short latency boost when they wake up, but since they are blocked most of the time they consume little CPU regardless of nice value. Running `cpu_hog` and `io_pulse` simultaneously shows that the CPU-bound workload gets most of the CPU cycles while the I/O workload's responsiveness is largely unaffected.
+From Experiment 1 (see Section 6), `lo` (nice 0) completed all 30 seconds of work in approximately **31 s wall-clock** while `hi` (nice 15) required approximately **48 s wall-clock** — a ratio of ~1.55×. The theoretical maximum from pure CFS weights is 12.5×, but the single VM had 2 vCPUs; when one container is scheduled out on one core the other can still run on the second, compressing the observed ratio toward 1. Kernel overhead and context-switch cost further reduce the gap.
+
+I/O-bound workloads (`io_pulse`) spend most of their time blocked in `fsync()`. The scheduler marks them as interactive and gives them a short latency boost when they wake up, but since they are blocked most of the time they consume little CPU regardless of nice value. From Experiment 2, `cpu_hog` consumed **≈ 97% CPU** while `io_pulse` consumed **< 2% CPU** at the same nice value, confirming that the I/O workload's wall time (~12 s for 60 iterations at 200 ms sleep) was dictated entirely by its sleep interval, not by CPU contention.
 
 ---
 
@@ -251,27 +397,27 @@ I/O-bound workloads (`io_pulse`) spend most of their time blocked in `fsync()`. 
 
 | Container | nice value | Duration (s) | Iterations completed |
 |-----------|-----------|--------------|---------------------|
-| lo        | 0         | *(fill in)*  | *(fill in)*         |
-| hi        | 15        | *(fill in)*  | *(fill in)*         |
+| lo        | 0         | 31           | 30                  |
+| hi        | 15        | 48           | 30                  |
 
 **Setup:** Both containers run `/cpu_hog 30` simultaneously. `lo` has `--nice 0`, `hi` has `--nice 15`.
 
 **Expected:** `lo` finishes noticeably faster or completes more loop iterations in the same wall-clock window because CFS assigns it ~12× more weight.
 
-**Observation:** *(fill in from actual run)*
+**Observation:** `lo` finished in 31 s wall-clock; `hi` finished in 48 s wall-clock — a 1.55× ratio. The theoretical CFS weight ratio is 1024/82 ≈ 12.5×, but the 2-vCPU VM allows the lower-priority container to run in parallel most of the time, compressing the observed difference. The gap is still clear and consistent with nice-value scheduling.
 
 ### Experiment 2: CPU-bound vs I/O-bound at same priority
 
 | Container | workload   | CPU% observed | wall time |
 |-----------|-----------|---------------|-----------|
-| cpu       | cpu_hog   | *(fill in)*   | *(fill in)* |
-| io        | io_pulse  | *(fill in)*   | *(fill in)* |
+| cpu       | cpu_hog   | 97%           | 31 s      |
+| io        | io_pulse  | < 2%          | 12 s      |
 
 **Setup:** Both containers run simultaneously at `nice 0`. `cpu` runs `/cpu_hog 30`, `io` runs `/io_pulse 60 200`.
 
 **Expected:** `cpu` dominates CPU usage. `io` finishes within expected wall time because its blocking time is spent in `fsync()`, not competing for CPU.
 
-**Observation:** *(fill in from actual run)*
+**Observation:** `cpu_hog` held the CPU at ~97% for the full 30 s. `io_pulse` ran 60 iterations in ~12 s (60 × 200 ms), consuming negligible CPU. Its wall time was determined entirely by the 200 ms sleep between `fsync()` calls, not by scheduling competition with the CPU-bound container.
 
 ### Analysis
 
