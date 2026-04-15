@@ -282,7 +282,7 @@ kundhan@ubuntu:~/boilerplate$ sudo ./engine stop alpha
 kundhan@ubuntu:~/boilerplate$ sudo ./engine stop beta
 [client] Response: status=0 message="SIGTERM sent to beta (pid=3834)"
 
-kundhan@ubuntu:~/boilerplate$ ^C   # Ctrl-C on supervisor terminal
+kundhan@ubuntu:~/boilerplate$ ^C   
 [supervisor] Signal received — draining log buffer...
 [supervisor] Consumer thread joined.
 [supervisor] All producer threads joined.
